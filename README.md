@@ -1,4 +1,6 @@
-This repository contains effecient and high throughput implementations, usually in Python and GPU optimized, for different computations, solvers and algorithms in physics. Mostly tailored towards computational electromagnetics but many of the implementations are designed for more general applicability to other domains.
+**A Library for useful computational physics implementations**
+
+This repository contains efficient and high throughput implementations, usually in Python and GPU optimized, for different computations, solvers and algorithms in physics. Mostly tailored towards computational electromagnetics but many of the implementations are designed for more general applicability to other domains.
 
 **List of implementations**
 
