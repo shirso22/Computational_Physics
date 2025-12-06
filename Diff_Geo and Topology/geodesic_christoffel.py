@@ -1,294 +1,186 @@
-
-#Computes geodesics for any general manifold, using Christoffel symbols, uses PyTorch for GPU acceleration
+#Computes geodesics on a general curved manifold taking the metric tensor as input. Uses Christoffel symbols and PyTorch based GPU acceleration.
 
 import torch
-import torch.nn as nn
-from torchdiffeq import odeint # PyTorch-compatible ODE solver
+from torch import nn
+from torchdiffeq import odeint_adjoint as odeint
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
-# --- Configuration ---
-# Set the device to GPU if available, otherwise CPU
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {DEVICE}")
-
-# Set the manifold dimension (for a 2D surface, D=2)
-D = 2 
-
-# --- 1. GENERALIZED CHRISTOFFEL SYMBOLS (PYTORCH) ---
+# Choose device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ChristoffelCalculator(nn.Module):
     """
-    A PyTorch module to compute the Christoffel Symbols (Gamma^i_jk)
-    for a general manifold, given its metric tensor function.
+    Efficient Christoffel symbol calculator for a D-dimensional manifold.
+    metric_fn: callable(u) -> (D,D) metric tensor (torch tensor)
+    - Uses torch.autograd.functional.jacobian to compute dg_ij/du^k
+    - Returns Gamma^i_{jk} with shape (D, D, D)
     """
-    def __init__(self, metric_fn, device=DEVICE):
+
+    def __init__(self, metric_fn, D, device=DEVICE, dtype=torch.float32, require_create_graph=False):
         super().__init__()
         self.metric_fn = metric_fn
+        self.D = D
         self.device = device
-        
-    def get_metric_and_derivatives(self, u):
-        """
-        Computes the metric tensor g_ij and its partial derivatives with
-        respect to the coordinates u^k using automatic differentiation.
-        
-        Args:
-            u (Tensor): Coordinates [u^1, u^2, ...]. Requires grad=True.
-            
-        Returns:
-            g (Tensor): Metric tensor g_ij(u). Shape (D, D).
-            dg_du (Tensor): Partial derivatives dg_ij / du^k. Shape (D, D, D).
-        """
-        # Ensure u is attached to the computational graph and on the correct device
-        u = u.to(self.device).requires_grad_(True)
+        self.dtype = dtype
+        # whether to create graph when computing jacobian (needed if you want to backprop through Christoffels)
+        self.require_create_graph = require_create_graph
 
-        # 1. Compute the metric tensor
-        g = self.metric_fn(u)
-        
-        # 2. Compute partial derivatives dg_ij / du^k
-        # This loop uses autograd to compute the Jacobian of the metric w.r.t coordinates u
-        dg_du_list = []
-        for k in range(D):
-            # Compute the derivative of g w.r.t u[k]
-            # torch.autograd.grad returns a tuple, we take the first element (the gradient tensor)
-            grad_g = torch.autograd.grad(
-                outputs=g.sum(),
-                inputs=u,
-                grad_outputs=torch.eye(D, D, device=self.device) if g.dim() == 2 else g,
-                retain_graph=True,
-                create_graph=True,
-                allow_unused=True
-            )[0]
-            # grad_g has shape (D, D) for the derivatives of g_ij w.r.t u^k
-            if grad_g is None:
-                # Handle cases where metric doesn't depend on a coordinate
-                dg_du_list.append(torch.zeros(D, D, device=self.device))
-            else:
-                dg_du_list.append(grad_g[:, :, k]) # Extract the partial derivatives
-        
-        dg_du = torch.stack(dg_du_list, dim=2) # Shape (D, D, D) -> dg_ij / du^k
-        
-        return g.detach(), dg_du.detach() # Detach from graph for Christoffel computation
-        
     def forward(self, u):
-        """Computes Gamma^i_jk(u) using the full formula."""
-        # Ensure u is 1D (D,) for a single point evaluation
-        if u.dim() > 1:
-             raise ValueError("Input u must be a 1D tensor of coordinates.")
-        
-        # Get g_ij and its derivatives dg_ij/du^k
-        u_for_grad = u.clone().requires_grad_(True)
-        g, dg_du = self.get_metric_and_derivatives(u_for_grad)
-        
-        # 1. Compute the inverse metric tensor g^il
-        g_inv = torch.inverse(g) # Shape (D, D)
-        
-        # 2. Compute the term in the parenthesis: (dg_lj/du^k + dg_lk/du^j - dg_jk/du^l)
-        # Note: Indices are: l, j, k
-        
-        # Permute dg_du to easily access the required derivatives
-        # dg_du_l = dg_lk / du^j -> Permute from (j, k, l) to (l, k, j)
-        dg_du_permuted = dg_du.permute(2, 1, 0)
-        
-        # Christoffel sum term: (dg_lj/du^k + dg_lk/du^j - dg_jk/du^l)
-        # Index mapping:
-        # dg_lj/du^k is dg_jk / du^l from original notation: dg_du[j, l, k]
-        # dg_lk/du^j is dg_jl / du^k from original notation: dg_du[l, k, j]
-        # dg_jk/du^l is dg_kl / du^j from original notation: dg_du[k, j, l]
-        
-        Gamma_sum = torch.zeros(D, D, D, device=self.device)
-        
-        for l in range(D):
-            for j in range(D):
-                for k in range(D):
-                    # Indices: l (top-left), j (bottom-left), k (bottom-right)
-                    # The sum uses indices l (first index of g_inv), j, k
-                    
-                    # Term 1: dg_{lj} / du^k
-                    T1 = dg_du[l, j, k]
-                    
-                    # Term 2: dg_{lk} / du^j
-                    T2 = dg_du[l, k, j]
-                    
-                    # Term 3: dg_{jk} / du^l
-                    T3 = dg_du[j, k, l]
-                    
-                    Gamma_sum[l, j, k] = T1 + T2 - T3
-        
-        # 3. Compute Gamma^i_jk = 1/2 * g^il * Gamma_sum_l_jk
-        # This is a matrix multiplication: (g_inv)_i^l * (Gamma_sum)_l^jk
-        Gamma = 0.5 * torch.einsum('il, ljk -> ijk', g_inv, Gamma_sum)
-        
-        # The result is Gamma^i_jk, shape (D, D, D)
+        """
+        Input:
+            u: tensor shape (D,) coordinates (float)
+        Output:
+            Gamma: tensor shape (D, D, D)  -> Gamma^i_{jk}
+        """
+        assert u.dim() == 1 and u.shape[0] == self.D, "u must be shape (D,)"
+
+        # ensure u on right device/dtype and requires grad for jacobian
+        u = u.to(device=self.device, dtype=self.dtype).requires_grad_(True)
+
+        # compute metric g_ij(u)
+        g = self.metric_fn(u)  # should return (D,D), dtype self.dtype, on self.device
+        if g.shape != (self.D, self.D):
+            raise ValueError(f"metric_fn must return shape ({self.D},{self.D}), got {tuple(g.shape)}")
+
+        # basic checks: symmetry
+        if not torch.allclose(g, g.T, atol=1e-6, rtol=1e-5):
+            # symmetrize to avoid tiny numerical asymmetry (but warn)
+            g = 0.5 * (g + g.T)
+
+        # check positive-definiteness via Cholesky (gives a clear error if not PD)
+        try:
+            _ = torch.linalg.cholesky(g)
+        except RuntimeError as e:
+            raise RuntimeError("Metric is not positive-definite at this point (Cholesky failed).") from e
+
+        # Compute jacobian: dg_ij/du^k -> shape (D, D, D) with indices (i,j,k) as desired
+        # Use torch.autograd.functional.jacobian for vector-output metric
+        # create_graph controls whether derivatives retain graph (useful if you intend to backprop through solution).
+        dg_du = torch.autograd.functional.jacobian(self.metric_fn, u, create_graph=self.require_create_graph)
+        # jacobian returns shape (D,D, D) as (i,j,k)
+        # ensure dtype & device
+        dg_du = dg_du.to(device=self.device, dtype=self.dtype)
+
+        # inverse metric
+        g_inv = torch.linalg.inv(g)  # shape (D,D)
+
+        # Build Gamma_sum_ljk = dg_du[l,j,k] + dg_du[l,k,j] - dg_du[j,k,l]
+        # Here dg_du has indices (i,j,k) -> ∂g_ij/∂u^k
+        term1 = dg_du  # (i,j,k)
+        term2 = dg_du.permute(0, 2, 1)  # (i,k,j) -- used as dg_du[i,k,j] => dg_du[l,k,j]
+        term3 = dg_du.permute(1, 2, 0)  # (j,k,i) -> dg_du[j,k,i]
+
+        # We want Gamma_sum with index ordering (l, j, k)
+        # term1[l,j,k] + term2[l,j,k] - term3[j,k,l] -- easiest to compute directly:
+        # Construct Gamma_sum as (l,j,k)
+        Gamma_sum = term1 + term2 - term3.permute(2, 0, 1)
+        # Explanation:
+        # term3.permute(2,0,1) yields (i -> k index?), verified to align with dg_du[j,k,l]
+
+        # Now contract g_inv (i.e. g^il) with Gamma_sum_ljk to produce Gamma^i_jk
+        # Gamma^i_jk = 1/2 * g^il * Gamma_sum_ljk
+        # einsum: 'il, ljk -> ijk'
+        Gamma = 0.5 * torch.einsum('il,ljk->ijk', g_inv, Gamma_sum)
+
         return Gamma
 
-# --- EXAMPLE METRIC: UNIT SPHERE (u^1=theta, u^2=phi) ---
-
-def sphere_metric(u):
-    """
-    Metric tensor for a unit sphere: 
-    ds^2 = d(theta)^2 + sin(theta)^2 d(phi)^2.
-    
-    Args:
-        u (Tensor): Coordinates [theta, phi].
-        
-    Returns:
-        Tensor: g_ij matrix.
-    """
-    theta = u[0]
-    sin_theta = torch.sin(theta)
-    
-    g = torch.zeros(D, D, device=u.device)
-    
-    # g_11 = 1 (index 0)
-    g[0, 0] = 1.0
-    
-    # g_22 = sin(theta)^2 (index 1)
-    g[1, 1] = sin_theta**2
-    
-    # g_12 = g_21 = 0
-    
-    return g
-
-# Initialize the Christoffel Calculator with the sphere's metric
-gamma_calculator = ChristoffelCalculator(sphere_metric).to(DEVICE)
-
-# --- 2. THE GEODESIC EQUATION (ODE SYSTEM - PYTORCH) ---
 
 class GeodesicODE(nn.Module):
     """
-    The right-hand side f(t, y) of the 1st-order ODE system for the geodesic equation.
-    dy/dt = f(t, y)
-    
-    y = [u^1, ..., u^D, v^1, ..., v^D] where v^i = du^i/dt
-    f = [v^1, ..., v^D, v_dot^1, ..., v_dot^D]
-    
-    The acceleration v_dot is:
-    v_dot^i = - Sum_{j,k} Gamma^i_{jk} * v^j * v^k
+    Geodesic ODE system for y = [u^1..u^D, v^1..v^D] 
+    where v^i = du^i/dt and v_dot^i = -Gamma^i_{jk} v^j v^k
     """
-    def __init__(self, gamma_calculator):
+
+    def __init__(self, christoffel_calculator):
         super().__init__()
-        self.gamma_calculator = gamma_calculator
-        
+        self.christoffel_calculator = christoffel_calculator
+        self.D = christoffel_calculator.D
+        self.device = christoffel_calculator.device
+        self.dtype = christoffel_calculator.dtype
+
     def forward(self, t, y):
-        """
-        Args:
-            t (Tensor): Time parameter. (Not explicitly used, as the metric is time-independent)
-            y (Tensor): State vector [u, v]. Shape (2*D,).
-            
-        Returns:
-            Tensor: Derivative vector [v, v_dot]. Shape (2*D,).
-        """
-        # Separate coordinates u and velocities v
-        u = y[:D] # [theta, phi]
-        v = y[D:] # [v_theta, v_phi]
-        
-        # 1. Get the Christoffel symbols evaluated at the current coordinates u
-        # Gamma[i, j, k] = Gamma^i_jk
-        Gamma = self.gamma_calculator(u)
-        
-        # 2. Calculate acceleration (v_dot)
-        # We use einsum for efficient tensor contraction:
-        # Sum_{j,k} Gamma^i_{jk} * v^j * v^k
-        # 'ijk, j, k -> i'
-        acceleration_sum = torch.einsum('ijk, j, k -> i', Gamma, v, v)
-        
-        v_dot = -acceleration_sum
-        
-        # 3. Return the full derivative vector [v, v_dot]
-        return torch.cat([v, v_dot])
+        # y shape (2*D,)
+        u = y[:self.D]
+        v = y[self.D:]
+        Gamma = self.christoffel_calculator(u)  # shape (D,D,D)
+        # contraction: 'ijk, j, k -> i'
+        acc = torch.einsum('ijk,j,k->i', Gamma, v, v)
+        v_dot = -acc
+        return torch.cat([v, v_dot]).to(dtype=self.dtype)
 
-geodesic_ode = GeodesicODE(gamma_calculator).to(DEVICE)
 
-# --- 3. SOLVING THE ODE SYSTEM (PYTORCH) ---
+# -----------------------
+# Example usage: unit sphere (theta, phi)
+# -----------------------
+def sphere_metric(u):
+    """
+    Metric for unit sphere:
+    ds^2 = dtheta^2 + sin^2(theta) dphi^2
+    Input: u = [theta, phi]
+    """
+    theta = u[0]
+    sin_t = torch.sin(theta)
+    g = torch.zeros((2, 2), dtype=theta.dtype, device=theta.device)
+    g[0, 0] = 1.0
+    g[1, 1] = sin_t ** 2
+    return g
 
-# Simulation Time
-T_SPAN = [0, 10]
-# PyTorch likes to receive the time points as a 1D tensor
-T_POINTS = torch.linspace(T_SPAN[0], T_SPAN[1], 500).to(DEVICE)
 
-# Initial Conditions (IC): [theta_0, phi_0, d_theta/dt_0, d_phi/dt_0]
-theta_0 = torch.tensor(np.radians(1.0), dtype=torch.float32) # Almost at North Pole (1 degree)
-phi_0 = torch.tensor(0.0, dtype=torch.float32)
+def run_sphere_geodesic_example(device=DEVICE):
+    D = 2
+    calc = ChristoffelCalculator(metric_fn=sphere_metric, D=D, device=device, dtype=torch.float32)
+    ode = GeodesicODE(calc).to(device)
 
-v_theta_0 = torch.tensor(0.5, dtype=torch.float32)
-v_phi_0 = torch.tensor(0.1, dtype=torch.float32)
+    # initial position near north pole and initial velocity
+    theta0 = torch.tensor(np.radians(1.0), dtype=torch.float32, device=device)
+    phi0 = torch.tensor(0.0, dtype=torch.float32, device=device)
+    u0 = torch.stack([theta0, phi0])
 
-# Normalization (optional, but good practice for unit speed parameterization)
-u_0 = torch.tensor([theta_0, phi_0])
-g_0 = sphere_metric(u_0) # Metric at initial point
-v_0 = torch.tensor([v_theta_0, v_phi_0])
+    v_theta = torch.tensor(0.5, dtype=torch.float32, device=device)
+    v_phi = torch.tensor(0.1, dtype=torch.float32, device=device)
+    v0 = torch.stack([v_theta, v_phi])
 
-# Speed squared: ||v||^2 = g_ij * v^i * v^j
-# einsum: 'ij, i, j ->' (sum over i and j)
-norm_sq = torch.einsum('ij, i, j ->', g_0, v_0, v_0)
+    # normalize to unit speed: ||v||^2 = g_ij v^i v^j
+    g0 = sphere_metric(u0)
+    norm_sq = torch.einsum('ij,i,j->', g0, v0, v0)
+    norm = torch.sqrt(norm_sq + 1e-12)
+    v0 = v0 / norm
 
-normalization_factor = torch.sqrt(1.0 / norm_sq)
-v_0_normalized = v_0 * normalization_factor
+    y0 = torch.cat([u0, v0]).to(device=device)
 
-# Initial state vector y0 = [u, v]
-y0 = torch.cat([u_0, v_0_normalized]).to(DEVICE)
+    t_span = torch.linspace(0.0, 10.0, 500, device=device)
 
-# Solve the ODE system using a PyTorch-compatible solver
-print("Solving ODE system...")
-solution_tensor = odeint(
-    func=geodesic_ode, 
-    y0=y0, 
-    t=T_POINTS, 
-    method='rk4' # Standard Runge-Kutta 4th order
-)
-print("ODE solution complete.")
+    print("Solving geodesic ODE on device:", device)
+    sol = odeint(ode, y0, t_span, method='rk4')  # shape (T, 2D)
+    sol = sol.cpu().numpy()
 
-# Extract coordinates and move to CPU for plotting (NumPy required for matplotlib)
-# solution_tensor has shape (T_POINTS, 2*D)
-solution_np = solution_tensor.cpu().numpy()
+    theta_path = sol[:, 0]
+    phi_path = sol[:, 1]
 
-theta_path = solution_np[:, 0]
-phi_path = solution_np[:, 1]
-# Velocities are in solution_np[:, 2] and solution_np[:, 3]
+    # convert to cartesian for plotting
+    X = np.sin(theta_path) * np.cos(phi_path)
+    Y = np.sin(theta_path) * np.sin(phi_path)
+    Z = np.cos(theta_path)
 
-# --- 4. CONVERT TO CARTESIAN FOR 3D PLOTTING (NUMPY) ---
+    # Plot
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    # sphere mesh
+    U, V = np.mgrid[0:2 * np.pi:100j, 0:np.pi:50j]
+    Xs = np.sin(V) * np.cos(U)
+    Ys = np.sin(V) * np.sin(U)
+    Zs = np.cos(V)
+    ax.plot_surface(Xs, Ys, Zs, color='lightgray', alpha=0.25)
+    ax.plot(X, Y, Z, color='red', linewidth=2)
+    ax.scatter(X[0], Y[0], Z[0], color='green', s=40, label='start')
+    ax.scatter(X[-1], Y[-1], Z[-1], color='blue', s=40, label='end')
+    ax.set_box_aspect([1, 1, 1])
+    plt.title("Geodesic on unit sphere")
+    plt.show()
 
-# Cartesian coordinates for the path
-X_path = np.sin(theta_path) * np.cos(phi_path)
-Y_path = np.sin(theta_path) * np.sin(phi_path)
-Z_path = np.cos(theta_path)
+    return sol
 
-# --- Create the background sphere surface ---
-# U = phi, V = theta (standard convention for sphere parametrization)
-U, V = np.mgrid[0:2*np.pi:100j, 0:np.pi:50j] 
-X_sphere = np.sin(V) * np.cos(U)
-Y_sphere = np.sin(V) * np.sin(U)
-Z_sphere = np.cos(V)
 
-# 
-
-# --- Plotting ---
-fig = plt.figure(figsize=(10, 8))
-ax = fig.add_subplot(111, projection='3d')
-ax.set_title(f"Geodesic on a Unit Sphere (PyTorch/GPU Accelerated) | Device: {DEVICE}")
-
-# 1. Plot the transparent sphere surface
-ax.plot_surface(X_sphere, Y_sphere, Z_sphere, 
-                color='lightblue', alpha=0.15, linewidth=0)
-
-# 2. Plot the calculated geodesic path
-ax.plot(X_path, Y_path, Z_path, color='red', linewidth=3, label='Geodesic Path')
-
-# 3. Mark the start and end points
-ax.scatter(X_path[0], Y_path[0], Z_path[0], color='green', s=50, label='Start')
-ax.scatter(X_path[-1], Y_path[-1], Z_path[-1], color='blue', s=50, label='End')
-
-# Set equal axis limits for a spherical appearance
-max_range = 1.1
-ax.set_xlim([-max_range, max_range])
-ax.set_ylim([-max_range, max_range])
-ax.set_zlim([-max_range, max_range])
-
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-ax.set_zlabel('Z')
-
-ax.legend()
-plt.show()
+if __name__ == "__main__":
+    sol = run_sphere_geodesic_example(device=DEVICE)
