@@ -21,6 +21,7 @@ def fourier_inversion_magnetization_mz(Bz_batch, z, dx, mu0=4 * torch.pi * 1e-7)
     """
     Reconstructs the 2D out-of-plane magnetization (Mz). Uses PyTorch for GPU acceleration and supports batch processing.
     Based on the theory presented in the paper "Improved Current Density and Magnetization Reconstruction Through Vector Magnetic Field Measurements" by Broadway et al, Physical Review Applied, 2020
+    Important thing to note, this method only cleanly reconstructs for a pure out of plane magnetization Mz, from the Bz component of the field, as in plane components amplify the noise.
 
     Args:
         Bz_batch (torch.Tensor): Tensor of measured Bz fields.
