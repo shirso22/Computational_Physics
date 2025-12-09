@@ -1,0 +1,29 @@
+# YAML format for Citation File Format (CFF)
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "Computational_Physics: A Python based scientific computing library"
+type: software
+authors:
+  - given-names: Shirsopratim
+    family-names: Chattopadhyay
+    #orcid: "https://orcid.org/0000-0000-0000-0000" # Placeholder for now
+keywords:
+  - scientific computing
+  - electromagnetism
+  - computational physics
+  - pytorch
+  - numerical methods
+  - gpu
+license: MIT
+repository-code: "https://github.com/shirso22/Computational_Physics"
+version: 0.1.0
+date-released: 2025-12-08
+preferred-citation:
+  type: software
+  authors:
+    - given-names: Shirsopratim
+      family-names: Chattopadhyay
+  title: "Computational_Physics: A Python based scientific computing library"
+  version: 0.1.0
+  date-released: 2025-12-08 # Updated to match the main date-released for consistency
+  url: "https://github.com/shirso22/Computational_Physics"
