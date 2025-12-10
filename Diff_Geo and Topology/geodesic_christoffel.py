@@ -1,4 +1,5 @@
 #Computes geodesics on a general curved manifold taking the metric tensor as input. Uses Christoffel symbols and PyTorch based GPU acceleration.
+#This code has been moved to a dedicated repository for Differential Geometry and Topology: https://github.com/shirso22/TorchManifolds
 
 import torch
 from torch import nn
