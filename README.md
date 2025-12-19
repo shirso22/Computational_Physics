@@ -12,4 +12,6 @@ This repository contains efficient and high throughput implementations, usually 
 
 **Geodesic computation on general curved manifold**: Computes geodesic paths on a general curved manifold by taking as input the metric tensor. Uses PyTorch for GPU acceleration. Shows an example with a spherical manifold.
 
+**Schrodinder 1D Time Independent equation with a Fourier Neural Operator (FNO)** : Fast, FNO based Schrodinger 1D time independent surrogate solver. Outputs wavefunctions as well as energies. Data generation script with scipy classical solver included. 
+
 
